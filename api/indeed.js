@@ -89,71 +89,114 @@ async function extractJobInfo(html) {
     
     console.log("Total number of jobs found:", totalNumberOfJobs);
     
-    // Method 1: Try to extract from script tags (current data format)
+    // First, try to extract all data from script tags
     const scripts = doc.querySelectorAll('script');
     console.log("Found", scripts.length, "script tags");
     
-    let jobDataFromScripts = [];
+    let scriptJobData = [];
+    let companyDataMap = new Map(); // Map job titles to company info
     
     scripts.forEach((script, index) => {
         const content = script.textContent;
-        if (content.length > 1000) {  // Only check larger scripts
+        if (content.length > 1000) {
             console.log(`Script ${index} content length:`, content.length);
             
-            // Look for job data patterns in scripts
-            if (content.includes('"jobkey"') || content.includes('"jobtitle"') || 
-                content.includes('"company"') || content.includes('"jobTitle"')) {
+            // Look for structured job data in scripts
+            if (content.includes('"jobkey"') || content.includes('"title"') || 
+                content.includes('"company"') || content.includes('"companyName"')) {
                 console.log(`Found potential job data in script ${index}`);
                 
                 try {
-                    // Try to find JSON structure with job data
-                    // Look for patterns like "jobtitle":"..." or "company":"..."
-                    const jobMatches = content.match(/"job[tT]itle":"([^"]+)"/g);
-                    const companyMatches = content.match(/"company":"([^"]+)"/g);
-                    const overviewMatches = content.match(/"companyOverviewLink":"([^"]+)"/g);
+                    // Extract job data using regex patterns
+                    // Pattern 1: Look for title and company pairs
+                    const titlePattern = /"title"\s*:\s*"([^"]+)"/g;
+                    const companyPattern = /"company"\s*:\s*"([^"]+)"/g;
+                    const companyNamePattern = /"companyName"\s*:\s*"([^"]+)"/g;
+                    const overviewPattern = /"companyOverviewLink"\s*:\s*"([^"]+)"/g;
                     
-                    if (jobMatches && companyMatches) {
-                        const numJobs = Math.min(jobMatches.length, companyMatches.length);
-                        for (let i = 0; i < numJobs; i++) {
-                            const jobTitle = jobMatches[i].match(/"job[tT]itle":"([^"]+)"/)[1];
-                            const company = companyMatches[i].match(/"company":"([^"]+)"/)[1];
-                            let companyLink = null;
-                            
-                            if (overviewMatches && overviewMatches[i]) {
-                                const link = overviewMatches[i].match(/"companyOverviewLink":"([^"]+)"/)[1];
-                                // Clean up the link
-                                if (link.startsWith('/cmp/')) {
-                                    companyLink = `https://www.indeed.com${link}`;
-                                } else {
-                                    companyLink = link
-                                        .replace(/\\u002F/g, '/')
-                                        .replace(/\\\//g, '/')
-                                        .replace(/\\/g, '');
-                                }
-                            }
-                            
-                            jobDataFromScripts.push({
-                                job_title: jobTitle.replace(/\\u[0-9a-fA-F]{4}/g, ''),  // Remove unicode escapes
-                                job_company: company.replace(/\\u[0-9a-fA-F]{4}/g, ''),
-                                companyOverviewLink: companyLink
-                            });
+                    let titles = [];
+                    let companies = [];
+                    let overviewLinks = [];
+                    
+                    // Extract titles
+                    let match;
+                    while ((match = titlePattern.exec(content)) !== null) {
+                        titles.push(match[1]);
+                    }
+                    
+                    // Extract companies (try both patterns)
+                    while ((match = companyPattern.exec(content)) !== null) {
+                        companies.push(match[1]);
+                    }
+                    
+                    if (companies.length === 0) {
+                        while ((match = companyNamePattern.exec(content)) !== null) {
+                            companies.push(match[1]);
                         }
                     }
                     
-                    // Alternative: Look for window._initialData or similar
-                    const dataMatch = content.match(/window\._initialData\s*=\s*({.+?});/s);
+                    // Extract overview links
+                    while ((match = overviewPattern.exec(content)) !== null) {
+                        const link = match[1];
+                        if (link.startsWith('/cmp/')) {
+                            overviewLinks.push(`https://www.indeed.com${link}`);
+                        } else if (link.includes('\\u002F')) {
+                            // Handle unicode escaped URLs
+                            const cleanLink = link
+                                .replace(/\\u002F/g, '/')
+                                .replace(/\\\//g, '/')
+                                .replace(/\\/g, '');
+                            overviewLinks.push(cleanLink.startsWith('http') ? cleanLink : `https://www.indeed.com${cleanLink}`);
+                        } else {
+                            overviewLinks.push(link);
+                        }
+                    }
+                    
+                    // Create job objects from extracted data
+                    const numJobs = Math.min(titles.length, companies.length);
+                    for (let i = 0; i < numJobs; i++) {
+                        const jobTitle = titles[i].replace(/\\u[0-9a-fA-F]{4}/g, ''); // Remove unicode escapes
+                        const companyName = companies[i].replace(/\\u[0-9a-fA-F]{4}/g, '');
+                        const overviewLink = overviewLinks[i] || null;
+                        
+                        scriptJobData.push({
+                            job_title: jobTitle,
+                            job_company: companyName,
+                            companyOverviewLink: overviewLink
+                        });
+                        
+                        // Store in map for later matching
+                        companyDataMap.set(jobTitle, {
+                            company: companyName,
+                            link: overviewLink
+                        });
+                    }
+                    
+                    // Alternative: Try to parse window._initialData
+                    const dataMatch = content.match(/window\._initialData\s*=\s*({[\s\S]*?});/);
                     if (dataMatch) {
                         try {
-                            const data = JSON.parse(dataMatch[1]);
-                            // Navigate through the data structure to find jobs
+                            // Clean the JSON string before parsing
+                            const cleanedJson = dataMatch[1]
+                                .replace(/\n/g, ' ')
+                                .replace(/\r/g, ' ')
+                                .replace(/\t/g, ' ');
+                            
+                            const data = JSON.parse(cleanedJson);
+                            
+                            // Navigate through various possible data structures
                             if (data.resultsListData && data.resultsListData.results) {
                                 data.resultsListData.results.forEach(job => {
-                                    jobDataFromScripts.push({
-                                        job_title: job.title || job.jobtitle,
-                                        job_company: job.company,
-                                        companyOverviewLink: job.companyOverviewLink ? 
-                                            `https://www.indeed.com${job.companyOverviewLink}` : null
-                                    });
+                                    const title = job.title || job.jobtitle || job.jobTitle;
+                                    const company = job.company || job.companyName;
+                                    const link = job.companyOverviewLink;
+                                    
+                                    if (title && company) {
+                                        companyDataMap.set(title, {
+                                            company: company,
+                                            link: link ? `https://www.indeed.com${link}` : null
+                                        });
+                                    }
                                 });
                             }
                         } catch (e) {
@@ -161,98 +204,179 @@ async function extractJobInfo(html) {
                         }
                     }
                 } catch (e) {
-                    console.log('Error parsing script content:', e.message);
+                    console.log('Error extracting from script:', e.message);
                 }
             }
         }
     });
     
-    // Method 2: Try DOM-based extraction with multiple selectors
-    const jobSelectors = [
-        // Current selectors
-        'h2.jobTitle',
-        'h2[class*="jobTitle"]',
-        '[data-testid="job-card"]',
-        '[class*="job_seen_beacon"]',
-        '[class*="jobsearch-SerpJobCard"]',
-        '[class*="job-card"]',
-        // Legacy selectors
+    // Now extract job cards from DOM
+    const jobCardSelectors = [
         '.jobsearch-SerpJobCard',
         '.job_seen_beacon',
-        '[data-jk]',  // Job key attribute
-        'a[data-testid="job-title"]',
-        '.jobTitle a',
-        'span[title]'  // Title spans within job cards
+        '[class*="job_seen_beacon"]',
+        '.jobsearch-ResultsList > li',
+        '[data-jk]',
+        'div[class*="slider_container"] .slider_item',
+        'td#resultsCol .result'
     ];
     
-    for (const selector of jobSelectors) {
-        const elements = doc.querySelectorAll(selector);
-        if (elements.length > 0) {
-            console.log(`Found ${elements.length} elements with selector: ${selector}`);
-            
-            elements.forEach(element => {
-                const job = {
-                    job_title: null,
-                    job_company: null,
-                    companyOverviewLink: null
-                };
-                
-                // Try to find job title
-                const titleSelectors = [
-                    'h2 span[title]',
-                    'h2 a span',
-                    'a[data-testid="job-title"]',
-                    '.jobTitle',
-                    '[class*="jobTitle"]',
-                    'a span[title]'
-                ];
-                
-                for (const titleSel of titleSelectors) {
-                    const titleEl = element.querySelector(titleSel) || 
-                                   (element.matches(titleSel) ? element : null);
-                    if (titleEl) {
-                        job.job_title = titleEl.getAttribute('title') || titleEl.textContent.trim();
-                        if (job.job_title) break;
-                    }
-                }
-                
-                // Try to find company name
-                const companySelectors = [
-                    '[data-testid="company-name"]',
-                    '.companyName',
-                    '[class*="companyName"]',
-                    'div[class*="company"]',
-                    'span[class*="company"]'
-                ];
-                
-                for (const companySel of companySelectors) {
-                    const companyEl = element.querySelector(companySel);
-                    if (companyEl) {
-                        job.job_company = companyEl.textContent.trim();
-                        if (job.job_company) break;
-                    }
-                }
-                
-                // Try to find company overview link
-                const linkEl = element.querySelector('a[href*="/cmp/"]');
-                if (linkEl) {
-                    job.companyOverviewLink = `https://www.indeed.com${linkEl.getAttribute('href')}`;
-                }
-                
-                // Only add if we found at least title or company
-                if (job.job_title || job.job_company) {
-                    results.push(job);
-                }
-            });
-            
-            if (results.length > 0) break; // Stop if we found jobs
+    let jobCards = [];
+    for (const selector of jobCardSelectors) {
+        jobCards = doc.querySelectorAll(selector);
+        if (jobCards.length > 0) {
+            console.log(`Found ${jobCards.length} job cards with selector: ${selector}`);
+            break;
         }
     }
     
-    // Use script data if DOM extraction failed
-    if (results.length === 0 && jobDataFromScripts.length > 0) {
-        console.log("Using data extracted from scripts");
-        results.push(...jobDataFromScripts);
+    // If no job cards found, try to find job title headers
+    if (jobCards.length === 0) {
+        const titleHeaders = doc.querySelectorAll('h2.jobTitle, h2[class*="jobTitle"]');
+        console.log(`Found ${titleHeaders.length} elements with selector: h2.jobTitle`);
+        
+        titleHeaders.forEach((titleHeader) => {
+            const job = {
+                job_title: null,
+                job_company: null,
+                companyOverviewLink: null
+            };
+            
+            // Get job title
+            const titleSpan = titleHeader.querySelector('span[title]') || 
+                            titleHeader.querySelector('a span') ||
+                            titleHeader.querySelector('span');
+            
+            if (titleSpan) {
+                job.job_title = titleSpan.getAttribute('title') || titleSpan.textContent.trim();
+            } else if (titleHeader.textContent) {
+                job.job_title = titleHeader.textContent.trim();
+            }
+            
+            // Try to find the parent job card container
+            let jobCard = titleHeader.closest('[class*="job_seen_beacon"]') ||
+                         titleHeader.closest('.jobsearch-SerpJobCard') ||
+                         titleHeader.closest('[data-jk]') ||
+                         titleHeader.closest('td.resultContent') ||
+                         titleHeader.parentElement?.parentElement;
+            
+            if (jobCard) {
+                // Look for company name within the job card
+                const companySelectors = [
+                    '[data-testid="company-name"]',
+                    'span[data-testid="company-name"]',
+                    'div[data-testid="company-name"]',
+                    '.companyName',
+                    '[class*="companyName"]',
+                    'a[data-testid="company-name"]',
+                    'div.company',
+                    'span.company'
+                ];
+                
+                for (const selector of companySelectors) {
+                    const companyEl = jobCard.querySelector(selector);
+                    if (companyEl && companyEl.textContent) {
+                        job.job_company = companyEl.textContent.trim();
+                        break;
+                    }
+                }
+                
+                // Look for company overview link
+                const linkEl = jobCard.querySelector('a[href*="/cmp/"]');
+                if (linkEl) {
+                    const href = linkEl.getAttribute('href');
+                    job.companyOverviewLink = href.startsWith('http') ? href : `https://www.indeed.com${href}`;
+                }
+            }
+            
+            // If we still don't have company info, try to get it from the script data
+            if (job.job_title && (!job.job_company || !job.companyOverviewLink)) {
+                const scriptData = companyDataMap.get(job.job_title);
+                if (scriptData) {
+                    if (!job.job_company && scriptData.company) {
+                        job.job_company = scriptData.company;
+                    }
+                    if (!job.companyOverviewLink && scriptData.link) {
+                        job.companyOverviewLink = scriptData.link;
+                    }
+                }
+            }
+            
+            // Only add if we have at least a job title
+            if (job.job_title) {
+                results.push(job);
+            }
+        });
+    } else {
+        // Process job cards if found
+        jobCards.forEach((card) => {
+            const job = {
+                job_title: null,
+                job_company: null,
+                companyOverviewLink: null
+            };
+            
+            // Extract job title
+            const titleSelectors = [
+                'h2.jobTitle span[title]',
+                'h2[class*="jobTitle"] span[title]',
+                'a[data-testid="job-title"]',
+                '.jobTitle',
+                'h2 a span',
+                'h2 span'
+            ];
+            
+            for (const selector of titleSelectors) {
+                const titleEl = card.querySelector(selector);
+                if (titleEl) {
+                    job.job_title = titleEl.getAttribute('title') || titleEl.textContent.trim();
+                    if (job.job_title) break;
+                }
+            }
+            
+            // Extract company name
+            const companySelectors = [
+                '[data-testid="company-name"]',
+                '.companyName',
+                '[class*="companyName"]',
+                'span.company',
+                'div.company'
+            ];
+            
+            for (const selector of companySelectors) {
+                const companyEl = card.querySelector(selector);
+                if (companyEl) {
+                    job.job_company = companyEl.textContent.trim();
+                    if (job.job_company) break;
+                }
+            }
+            
+            // Extract company overview link
+            const linkEl = card.querySelector('a[href*="/cmp/"]');
+            if (linkEl) {
+                const href = linkEl.getAttribute('href');
+                job.companyOverviewLink = href.startsWith('http') ? href : `https://www.indeed.com${href}`;
+            }
+            
+            // Use script data as fallback
+            if (job.job_title && (!job.job_company || !job.companyOverviewLink)) {
+                const scriptData = companyDataMap.get(job.job_title);
+                if (scriptData) {
+                    if (!job.job_company) job.job_company = scriptData.company;
+                    if (!job.companyOverviewLink) job.companyOverviewLink = scriptData.link;
+                }
+            }
+            
+            if (job.job_title) {
+                results.push(job);
+            }
+        });
+    }
+    
+    // If DOM extraction didn't work well, use script data
+    if (results.length === 0 && scriptJobData.length > 0) {
+        console.log("Using script-extracted data as fallback");
+        results.push(...scriptJobData);
     }
     
     console.log("Total job data found:", results.length);
