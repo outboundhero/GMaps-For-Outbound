@@ -103,13 +103,15 @@ async function extractJobInfo(html) {
             
             // Look for structured job data in scripts
             if (content.includes('"jobkey"') || content.includes('"title"') || 
-                content.includes('"company"') || content.includes('"companyName"')) {
+                content.includes('"company"') || content.includes('"companyName"') ||
+                content.includes('"jobtitle"')) {
                 console.log(`Found potential job data in script ${index}`);
                 
                 try {
                     // Extract job data using regex patterns
                     // Pattern 1: Look for title and company pairs
                     const titlePattern = /"title"\s*:\s*"([^"]+)"/g;
+                    const jobTitlePattern = /"jobtitle"\s*:\s*"([^"]+)"/g;
                     const companyPattern = /"company"\s*:\s*"([^"]+)"/g;
                     const companyNamePattern = /"companyName"\s*:\s*"([^"]+)"/g;
                     const overviewPattern = /"companyOverviewLink"\s*:\s*"([^"]+)"/g;
@@ -118,10 +120,17 @@ async function extractJobInfo(html) {
                     let companies = [];
                     let overviewLinks = [];
                     
-                    // Extract titles
+                    // Extract titles (try both patterns)
                     let match;
                     while ((match = titlePattern.exec(content)) !== null) {
                         titles.push(match[1]);
+                    }
+                    
+                    // If no titles found, try jobtitle pattern
+                    if (titles.length === 0) {
+                        while ((match = jobTitlePattern.exec(content)) !== null) {
+                            titles.push(match[1]);
+                        }
                     }
                     
                     // Extract companies (try both patterns)
@@ -152,6 +161,24 @@ async function extractJobInfo(html) {
                         }
                     }
                     
+                    // Also try to find job data in a more structured way
+                    // Look for patterns like {title:"...",company:"..."}
+                    const structuredPattern = /\{[^}]*"(?:title|jobtitle)"\s*:\s*"([^"]+)"[^}]*"(?:company|companyName)"\s*:\s*"([^"]+)"[^}]*\}/g;
+                    while ((match = structuredPattern.exec(content)) !== null) {
+                        const title = match[1].replace(/\\u[0-9a-fA-F]{4}/g, '');
+                        const company = match[2].replace(/\\u[0-9a-fA-F]{4}/g, '');
+                        
+                        // Add to map for matching
+                        companyDataMap.set(title, {
+                            company: company,
+                            link: null
+                        });
+                        
+                        // Also add to arrays if not already there
+                        if (!titles.includes(title)) titles.push(title);
+                        if (!companies.includes(company)) companies.push(company);
+                    }
+                    
                     // Create job objects from extracted data
                     const numJobs = Math.min(titles.length, companies.length);
                     for (let i = 0; i < numJobs; i++) {
@@ -170,6 +197,20 @@ async function extractJobInfo(html) {
                             company: companyName,
                             link: overviewLink
                         });
+                    }
+                    
+                    console.log(`Extracted from script ${index}:`, {
+                        titlesFound: titles.length,
+                        companiesFound: companies.length,
+                        overviewLinksFound: overviewLinks.length,
+                        mapSize: companyDataMap.size
+                    });
+                    
+                    if (titles.length > 0) {
+                        console.log('Sample titles:', titles.slice(0, 3));
+                    }
+                    if (companies.length > 0) {
+                        console.log('Sample companies:', companies.slice(0, 3));
                     }
                     
                     // Alternative: Try to parse window._initialData
@@ -218,7 +259,9 @@ async function extractJobInfo(html) {
         '.jobsearch-ResultsList > li',
         '[data-jk]',
         'div[class*="slider_container"] .slider_item',
-        'td#resultsCol .result'
+        'td#resultsCol .result',
+        '.jobsearch-ResultsList [class*="result"]',
+        'div[class*="jobsearch-ResultsList"] > div'
     ];
     
     let jobCards = [];
@@ -258,17 +301,21 @@ async function extractJobInfo(html) {
                          titleHeader.closest('.jobsearch-SerpJobCard') ||
                          titleHeader.closest('[data-jk]') ||
                          titleHeader.closest('td.resultContent') ||
+                         titleHeader.parentElement?.parentElement?.parentElement ||
                          titleHeader.parentElement?.parentElement;
             
             if (jobCard) {
-                // Look for company name within the job card
+                // Look for company name within the job card - search broader area
                 const companySelectors = [
                     '[data-testid="company-name"]',
                     'span[data-testid="company-name"]',
                     'div[data-testid="company-name"]',
+                    'a[data-testid="company-name"]',
                     '.companyName',
                     '[class*="companyName"]',
-                    'a[data-testid="company-name"]',
+                    'div[class*="company"]',
+                    'span[class*="company"]',
+                    'a[class*="company"]',
                     'div.company',
                     'span.company'
                 ];
@@ -276,8 +323,33 @@ async function extractJobInfo(html) {
                 for (const selector of companySelectors) {
                     const companyEl = jobCard.querySelector(selector);
                     if (companyEl && companyEl.textContent) {
-                        job.job_company = companyEl.textContent.trim();
-                        break;
+                        // Clean up the company name
+                        let companyText = companyEl.textContent.trim();
+                        // Remove any "new" badges or extra text
+                        companyText = companyText.replace(/\bnew\b/gi, '').trim();
+                        if (companyText && companyText.length > 0) {
+                            job.job_company = companyText;
+                            break;
+                        }
+                    }
+                }
+                
+                // If still no company, look in the next sibling or broader area
+                if (!job.job_company) {
+                    const nextElement = titleHeader.nextElementSibling;
+                    if (nextElement) {
+                        for (const selector of companySelectors) {
+                            const companyEl = nextElement.querySelector(selector) || 
+                                            (nextElement.matches(selector) ? nextElement : null);
+                            if (companyEl && companyEl.textContent) {
+                                let companyText = companyEl.textContent.trim();
+                                companyText = companyText.replace(/\bnew\b/gi, '').trim();
+                                if (companyText && companyText.length > 0) {
+                                    job.job_company = companyText;
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
                 
@@ -309,7 +381,7 @@ async function extractJobInfo(html) {
         });
     } else {
         // Process job cards if found
-        jobCards.forEach((card) => {
+        jobCards.forEach((card, cardIndex) => {
             const job = {
                 job_title: null,
                 job_company: null,
@@ -334,37 +406,79 @@ async function extractJobInfo(html) {
                 }
             }
             
-            // Extract company name
+            // Extract company name - look for the ACTUAL company element, not just any text
             const companySelectors = [
                 '[data-testid="company-name"]',
+                'div[data-testid="company-name"]',
+                'span[data-testid="company-name"]',
+                'a[data-testid="company-name"]',
                 '.companyName',
                 '[class*="companyName"]',
-                'span.company',
-                'div.company'
+                'div.companyName',
+                'span.companyName'
             ];
             
             for (const selector of companySelectors) {
                 const companyEl = card.querySelector(selector);
                 if (companyEl) {
-                    job.job_company = companyEl.textContent.trim();
-                    if (job.job_company) break;
+                    let companyText = companyEl.textContent.trim();
+                    // Clean up company name
+                    companyText = companyText.replace(/\bnew\b/gi, '').trim();
+                    if (companyText && companyText.length > 0) {
+                        job.job_company = companyText;
+                        break;
+                    }
                 }
             }
             
-            // Extract company overview link
-            const linkEl = card.querySelector('a[href*="/cmp/"]');
-            if (linkEl) {
-                const href = linkEl.getAttribute('href');
-                job.companyOverviewLink = href.startsWith('http') ? href : `https://www.indeed.com${href}`;
+            // Extract company overview link - ONLY from the same card
+            // Look for company link that's actually related to the company name
+            const linkSelectors = [
+                'a[href*="/cmp/"][data-testid="company-name"]',
+                'div[data-testid="company-name"] a[href*="/cmp/"]',
+                'span[data-testid="company-name"] a[href*="/cmp/"]',
+                '.companyName a[href*="/cmp/"]',
+                'a.companyName[href*="/cmp/"]'
+            ];
+            
+            for (const selector of linkSelectors) {
+                const linkEl = card.querySelector(selector);
+                if (linkEl) {
+                    const href = linkEl.getAttribute('href');
+                    job.companyOverviewLink = href.startsWith('http') ? href : `https://www.indeed.com${href}`;
+                    break;
+                }
             }
             
-            // Use script data as fallback
+            // If no link found with specific selectors, try general link but verify it matches company
+            if (!job.companyOverviewLink && job.job_company) {
+                const allLinks = card.querySelectorAll('a[href*="/cmp/"]');
+                for (const link of allLinks) {
+                    const href = link.getAttribute('href');
+                    // Check if the link text matches the company name
+                    if (link.textContent && link.textContent.includes(job.job_company)) {
+                        job.companyOverviewLink = href.startsWith('http') ? href : `https://www.indeed.com${href}`;
+                        break;
+                    }
+                }
+            }
+            
+            // Only use script data as fallback if we have matching title
             if (job.job_title && (!job.job_company || !job.companyOverviewLink)) {
                 const scriptData = companyDataMap.get(job.job_title);
                 if (scriptData) {
                     if (!job.job_company) job.job_company = scriptData.company;
                     if (!job.companyOverviewLink) job.companyOverviewLink = scriptData.link;
                 }
+            }
+            
+            // Log for debugging
+            if (cardIndex < 3) {
+                console.log(`Job ${cardIndex + 1} extracted:`, {
+                    title: job.job_title,
+                    company: job.job_company,
+                    link: job.companyOverviewLink
+                });
             }
             
             if (job.job_title) {
@@ -539,7 +653,192 @@ async function scrapeCompanyOverview(companyUrl) {
     }
 }
 
+async function saveToKV(authToken, finalJobs, totalNumberOfJobs, keyword, location, extra) {
+    try {
+        const tokenIndex = getValidTokens().indexOf(authToken);
+        const timestamp = new Date().toISOString();
+        
+        await kv.set(`indeed:count:${tokenIndex + 1}:${timestamp}`, {
+            count: finalJobs.length,
+            total_number_of_jobs: totalNumberOfJobs,
+            pages_scraped: getTokenCounter(authToken),
+            keyword,
+            location,
+            timestamp
+        });
+
+        await kv.set(`indeed:jobs:${tokenIndex + 1}:${timestamp}`, {
+            jobs: finalJobs,
+            extra: extra || null
+        });
+
+        await kv.incr(`indeed:total_count:token${tokenIndex + 1}`);
+    } catch (error) {
+        console.error('Error saving to KV store:', error);
+    }
+}
+
+async function processJobSearch(req, authToken) {
+    const { keyword, location, company_details, extra } = req.body;
+    console.log('Search parameters:', { keyword, location, company_details, extra });
+    
+    if (!keyword || !location) {
+        throw new Error('Keyword and location are required in the request body');
+    }
+    
+    // Initial attempt without premium
+    let { scraperUrl } = generateIndeedUrls(keyword, location, 0);
+    console.log('Initial ScraperAPI URL:', scraperUrl);
+
+    let response = await fetch(scraperUrl);
+    console.log('Initial ScraperAPI response status:', response.status);
+    
+    // Implement retry logic with premium and ultra_premium
+    let retryCount = 0;
+    let html = '';
+    
+    while (response.status === 500 && retryCount < 2) {
+        retryCount++;
+        const premiumLevel = retryCount === 1 ? true : 'ultra';
+        console.log(`Retry ${retryCount} with premium level:`, premiumLevel);
+        
+        const { scraperUrl: retryUrl } = generateIndeedUrls(keyword, location, 0, premiumLevel);
+        response = await fetch(retryUrl);
+        console.log(`Retry ${retryCount} response status:`, response.status);
+    }
+    
+    html = await response.text();
+    console.log('Raw HTML from first page (first 1000 chars):', html.substring(0, 1000));
+    
+    // Check if we got an error message instead of HTML
+    if (html.includes('Request failed') || html.includes('Protected domains')) {
+        console.error('ScraperAPI error:', html);
+        throw new Error('Indeed may require additional authentication or is blocking scraping attempts');
+    }
+    
+    // Extract job information from the scraped HTML
+    const firstPageJobs = await extractJobInfo(html);
+    console.log('First page jobs extracted:', JSON.stringify(firstPageJobs, null, 2));
+    
+    // Only continue to other pages if we found jobs on the first page
+    const allJobs = [...firstPageJobs.jobs];
+    incrementTokenCounter(authToken);
+    
+    if (allJobs.length > 0) {
+        const totalPages = await totalNumberOfPages(html);
+        console.log('Total pages found:', totalPages);
+        
+        // Limit pages to avoid excessive scraping and timeout
+        const maxPages = Math.min(totalPages, 2); // Reduced to 2 pages to prevent timeout
+        
+        for (let i = 1; i < maxPages; i++) {
+            console.log(`\nProcessing page ${i + 1} of ${maxPages}`);
+            const { scraperUrl } = generateIndeedUrls(keyword, location, i);
+            console.log(`ScraperAPI URL for page ${i + 1}:`, scraperUrl);
+            
+            const response = await fetch(scraperUrl);
+            console.log(`ScraperAPI response status for page ${i + 1}:`, response.status);
+            
+            if (response.status === 200) {
+                const html = await response.text();
+                const pageJobs = await extractJobInfo(html);
+                console.log(`Jobs extracted from page ${i + 1}:`, pageJobs.jobs.length);
+                
+                allJobs.push(...pageJobs.jobs);
+                incrementTokenCounter(authToken);
+            } else {
+                console.log(`Skipping page ${i + 1} due to error`);
+                break; // Stop pagination on error
+            }
+        }
+    }
+
+    let finalJobs = allJobs;
+
+    // Only process company details if requested and we have jobs
+    if (company_details && company_details !== 'False' && allJobs.length > 0) {
+        console.log('\nStarting company overview scraping...');
+        
+        // Limit company detail fetching to first 5 jobs to avoid timeout
+        const jobsToProcess = allJobs.slice(0, 5);
+        
+        // Process company details in parallel with timeout for each
+        const companyDetailsPromises = jobsToProcess.map(async (job, index) => {
+            console.log(`\nProcessing company overview for job ${index + 1} of ${jobsToProcess.length}`);
+            let cleanedJob = { ...job };
+            
+            if (job.companyOverviewLink) {
+                try {
+                    // Set individual timeout for company detail fetch (5 seconds)
+                    const companyTimeout = new Promise((resolve) => 
+                        setTimeout(() => resolve({ industry: null, websiteUrl: null }), 5000)
+                    );
+                    
+                    const withoutQuery = job.companyOverviewLink.split('?')[0];
+                    const cleanedUrl = withoutQuery
+                        .replace(/\\u002F/g, '/')
+                        .replace(/\\\//g, '/')
+                        .replace(/\\/g, '');
+                    
+                    cleanedJob.companyOverviewLink = cleanedUrl;
+                    console.log(`Company overview URL for job ${index + 1}:`, cleanedUrl);
+                    
+                    const { industry, websiteUrl } = await Promise.race([
+                        scrapeCompanyOverview(cleanedUrl),
+                        companyTimeout
+                    ]);
+                    
+                    if (industry) cleanedJob.industry = industry;
+                    if (websiteUrl) cleanedJob.websiteUrl = websiteUrl;
+                } catch (err) {
+                    console.log(`Failed to get company details for job ${index + 1}:`, err.message);
+                }
+            }
+            
+            return cleanedJob;
+        });
+        
+        finalJobs = await Promise.all(companyDetailsPromises);
+        
+        // Add remaining jobs without company details
+        if (allJobs.length > 5) {
+            finalJobs.push(...allJobs.slice(5));
+        }
+    } else if (!company_details || company_details === 'False') {
+        // If company_details is false, only keep basic info
+        finalJobs = allJobs.map(job => ({
+            job_title: job.job_title,
+            job_company: job.job_company
+        }));
+    }
+
+    console.log('\nFinal processed jobs:', finalJobs.length);
+
+    const responseData = {
+        count: finalJobs.length,
+        total_number_of_jobs: firstPageJobs.total_number_of_jobs,
+        jobs: finalJobs,
+        pages_scraped: getTokenCounter(authToken)
+    };
+
+    if (extra) {
+        responseData.extra = extra;
+    }
+
+    // Save to KV store (but don't wait for it)
+    saveToKV(authToken, finalJobs, firstPageJobs.total_number_of_jobs, keyword, location, extra).catch(err => 
+        console.error('Error saving to KV store:', err)
+    );
+
+    return responseData;
+}
+
 export default async function handler(req, res) {
+    // Set a timeout for the entire request (55 seconds to allow time for response)
+    const timeoutPromise = new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Request timeout - processing took too long')), 55000)
+    );
+    
     if (req.method !== 'POST') {
         res.setHeader('Allow', ['POST']);
         return res.status(405).end(`Method ${req.method} Not Allowed`);
@@ -552,173 +851,28 @@ export default async function handler(req, res) {
     }
 
     try {
-        const { keyword, location, company_details, extra } = req.body;
-        console.log('Search parameters:', { keyword, location, company_details, extra });
+        // Wrap the main logic in Promise.race with timeout
+        const result = await Promise.race([
+            processJobSearch(req, authToken),
+            timeoutPromise
+        ]);
         
-        if (!keyword || !location) {
-            return res.status(400).json({ 
-                error: 'Keyword and location are required in the request body' 
-            });
-        }
-        
-        // Initial attempt without premium
-        let { scraperUrl } = generateIndeedUrls(keyword, location, 0);
-        console.log('Initial ScraperAPI URL:', scraperUrl);
-
-        let response = await fetch(scraperUrl);
-        console.log('Initial ScraperAPI response status:', response.status);
-        
-        // Implement retry logic with premium and ultra_premium
-        let retryCount = 0;
-        let html = '';
-        
-        while (response.status === 500 && retryCount < 2) {
-            retryCount++;
-            const premiumLevel = retryCount === 1 ? true : 'ultra';
-            console.log(`Retry ${retryCount} with premium level:`, premiumLevel);
-            
-            const { scraperUrl: retryUrl } = generateIndeedUrls(keyword, location, 0, premiumLevel);
-            response = await fetch(retryUrl);
-            console.log(`Retry ${retryCount} response status:`, response.status);
-        }
-        
-        html = await response.text();
-        console.log('Raw HTML from first page (first 1000 chars):', html.substring(0, 1000));
-        
-        // Check if we got an error message instead of HTML
-        if (html.includes('Request failed') || html.includes('Protected domains')) {
-            console.error('ScraperAPI error:', html);
-            return res.status(500).json({ 
-                error: 'Failed to scrape Indeed - the site may be blocking requests',
-                message: 'Indeed may require additional authentication or is blocking scraping attempts'
-            });
-        }
-        
-        // Extract job information from the scraped HTML
-        const firstPageJobs = await extractJobInfo(html);
-        console.log('First page jobs extracted:', JSON.stringify(firstPageJobs, null, 2));
-        
-        // Only continue to other pages if we found jobs on the first page
-        const allJobs = [...firstPageJobs.jobs];
-        incrementTokenCounter(authToken);
-        
-        if (allJobs.length > 0) {
-            const totalPages = await totalNumberOfPages(html);
-            console.log('Total pages found:', totalPages);
-            
-            // Limit pages to avoid excessive scraping
-            const maxPages = Math.min(totalPages, 3); // Limit to 3 pages max
-            
-            for (let i = 1; i < maxPages; i++) {
-                console.log(`\nProcessing page ${i + 1} of ${maxPages}`);
-                const { scraperUrl } = generateIndeedUrls(keyword, location, i);
-                console.log(`ScraperAPI URL for page ${i + 1}:`, scraperUrl);
-                
-                const response = await fetch(scraperUrl);
-                console.log(`ScraperAPI response status for page ${i + 1}:`, response.status);
-                
-                if (response.status === 200) {
-                    const html = await response.text();
-                    const pageJobs = await extractJobInfo(html);
-                    console.log(`Jobs extracted from page ${i + 1}:`, pageJobs.jobs.length);
-                    
-                    allJobs.push(...pageJobs.jobs);
-                    incrementTokenCounter(authToken);
-                } else {
-                    console.log(`Skipping page ${i + 1} due to error`);
-                    break; // Stop pagination on error
-                }
-            }
-        }
-
-        let finalJobs = allJobs;
-
-        // Only process company details if requested and we have jobs
-        if (company_details && allJobs.length > 0) {
-            console.log('\nStarting company overview scraping...');
-            
-            // Limit company detail fetching to first 10 jobs to avoid rate limiting
-            const jobsToProcess = allJobs.slice(0, 10);
-            
-            finalJobs = await Promise.all(jobsToProcess.map(async (job, index) => {
-                console.log(`\nProcessing company overview for job ${index + 1} of ${jobsToProcess.length}`);
-                let cleanedJob = { ...job };
-                
-                if (job.companyOverviewLink) {
-                    const withoutQuery = job.companyOverviewLink.split('?')[0];
-                    const cleanedUrl = withoutQuery
-                        .replace(/\\u002F/g, '/')
-                        .replace(/\\\//g, '/')
-                        .replace(/\\/g, '');
-                    
-                    cleanedJob.companyOverviewLink = cleanedUrl;
-                    console.log(`Company overview URL for job ${index + 1}:`, cleanedUrl);
-                    
-                    const { industry, websiteUrl } = await scrapeCompanyOverview(cleanedUrl);
-                    
-                    if (industry) cleanedJob.industry = industry;
-                    if (websiteUrl) cleanedJob.websiteUrl = websiteUrl;
-                }
-                
-                return cleanedJob;
-            }));
-            
-            // Add remaining jobs without company details
-            if (allJobs.length > 10) {
-                finalJobs.push(...allJobs.slice(10));
-            }
-        } else if (!company_details) {
-            // If company_details is false, only keep basic info
-            finalJobs = allJobs.map(job => ({
-                job_title: job.job_title,
-                job_company: job.job_company
-            }));
-        }
-
-        console.log('\nFinal processed jobs:', finalJobs.length);
-
-        const responseData = {
-            count: finalJobs.length,
-            total_number_of_jobs: firstPageJobs.total_number_of_jobs,
-            jobs: finalJobs,
-            pages_scraped: getTokenCounter(authToken)
-        };
-
-        if (extra) {
-            responseData.extra = extra;
-        }
-
-        // Save to KV store
-        try {
-            const tokenIndex = getValidTokens().indexOf(authToken);
-            const timestamp = new Date().toISOString();
-            
-            await kv.set(`indeed:count:${tokenIndex + 1}:${timestamp}`, {
-                count: finalJobs.length,
-                total_number_of_jobs: firstPageJobs.total_number_of_jobs,
-                pages_scraped: getTokenCounter(authToken),
-                keyword,
-                location,
-                timestamp
-            });
-
-            await kv.set(`indeed:jobs:${tokenIndex + 1}:${timestamp}`, {
-                jobs: finalJobs,
-                extra: extra || null
-            });
-
-            await kv.incr(`indeed:total_count:token${tokenIndex + 1}`);
-        } catch (error) {
-            console.error('Error saving to KV store:', error);
-        }
-
-        res.json(responseData);
+        res.json(result);
 
     } catch (error) {
-        console.error('Error scraping job info:', error);
-        res.status(500).json({ 
-            error: 'Failed to scrape job information',
-            message: error.message 
-        });
+        console.error('Error in handler:', error);
+        
+        if (error.message === 'Request timeout - processing took too long') {
+            res.status(504).json({ 
+                error: 'Request timeout',
+                message: 'The request took too long to process. Try reducing the scope or disabling company_details.',
+                partial_results: []
+            });
+        } else {
+            res.status(500).json({ 
+                error: 'Failed to scrape job information',
+                message: error.message 
+            });
+        }
     }
 }
